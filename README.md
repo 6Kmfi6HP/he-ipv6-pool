@@ -45,10 +45,12 @@
 
 ```bash
 ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
-curl -fLo he-ipv6-pool https://github.com/x6nux/he-ipv6-pool/releases/latest/download/he-ipv6-pool-linux-$ARCH
-chmod +x he-ipv6-pool
-sudo ./he-ipv6-pool install -server <Server IPv4> -prefix <Routed /64>,<Routed /48>
+curl -fLo /tmp/he-ipv6-pool https://github.com/x6nux/he-ipv6-pool/releases/latest/download/he-ipv6-pool-linux-$ARCH
+chmod +x /tmp/he-ipv6-pool
+sudo /tmp/he-ipv6-pool install -server <Server IPv4> -prefix <Routed /64>,<Routed /48>
 ```
+
+升级到新版本：用同样的方法下载，再执行一次 `sudo /tmp/he-ipv6-pool install`，原有配置保留。
 
 `install` 会把程序装到 `/opt/he-ipv6-pool`，创建系统用户 `hepool` 和 systemd 服务 `he-ipv6-pool`，在 iptables 里放行协议 41 和代理端口（装了 netfilter-persistent 时会持久化），然后启动服务并打印连接信息。端口、用户名、密码没有指定时随机生成。
 
