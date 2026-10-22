@@ -30,7 +30,7 @@ he-ipv6-pool uninstall                                          卸载
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-c <路径>` | `config.json` | 配置文件路径，格式见[第 2 节](#2-配置文件-configjson) |
+| `-c <路径>` | `config.json` | 配置文件路径，格式见[第 2 节](#2-配置文件-configjson)。也可以只用[环境变量](#21-环境变量)配置，这时配置文件可以不存在 |
 | `-v` | 关 | 输出 debug 日志（每个失败连接的原因等） |
 | `-version` | — | 打印版本号后退出。发布版是标签名（如 `v1.0.0`），自己编译的是 `dev` |
 
@@ -120,22 +120,36 @@ journalctl -u he-ipv6-pool -f      # 日志
 
 ### 1.8 Docker
 
-镜像 `ghcr.io/x6nux/he-ipv6-pool`，支持 linux/amd64 和 linux/arm64，基于 `scratch`，里面只有一个静态二进制。默认命令是 `-c /etc/he-ipv6-pool/config.json`，把配置文件挂载到这个位置即可。
+镜像 `ghcr.io/x6nux/he-ipv6-pool`，支持 linux/amd64 和 linux/arm64，基于 `scratch`，里面只有一个静态二进制。推荐用[环境变量](#21-环境变量)配置；也可以把配置文件挂载到 `/etc/he-ipv6-pool/config.json`（默认命令是 `-c /etc/he-ipv6-pool/config.json`），两者同时使用时环境变量优先。
 
 | 镜像标签 | 说明 |
 |---|---|
 | `latest` | 最新正式版 |
-| `0.2.0` | 指定版本（标签名去掉 `v`） |
-| `0.2` | 0.2 系列的最新版本 |
-| `0.3.0-rc1` 等 | 预发布版本只打完整版本号，不会更新 `latest` 和 `0.3` |
+| `0.3.0` | 指定版本（标签名去掉 `v`） |
+| `0.3` | 0.3 系列的最新版本 |
+| `0.4.0-rc1` 等 | 预发布版本只打完整版本号，不会更新 `latest` 和 `0.4` |
+
+**Docker Compose**（推荐）：仓库里的 [`compose.yaml`](../compose.yaml) 已经写好了下面这些参数，配置从同目录的 `.env` 读取，模板是 [`.env.example`](../.env.example)：
+
+```bash
+curl -fLO https://raw.githubusercontent.com/x6nux/he-ipv6-pool/main/compose.yaml
+curl -fL https://raw.githubusercontent.com/x6nux/he-ipv6-pool/main/.env.example -o .env
+vi .env                       # 必填项留空时 docker compose 会报错并提示要填什么
+docker compose up -d
+docker compose logs -f        # 日志
+docker compose pull && docker compose up -d   # 升级
+```
+
+`.env` 里设置 `IMAGE_TAG=0.3.0` 可以固定镜像版本，默认是 `latest`。
+
+**docker run**：
 
 ```bash
 docker run -d --name he-ipv6-pool --restart unless-stopped \
   --network host --cap-drop ALL --cap-add NET_RAW --read-only \
-  -v /etc/he-ipv6-pool/config.json:/etc/he-ipv6-pool/config.json:ro \
+  --env-file .env \
   ghcr.io/x6nux/he-ipv6-pool:latest
 
-docker logs -f he-ipv6-pool                              # 日志
 docker run --rm ghcr.io/x6nux/he-ipv6-pool:latest -version
 ```
 
@@ -144,7 +158,7 @@ docker run --rm ghcr.io/x6nux/he-ipv6-pool:latest -version
 | `--network host` | **必需**。直接使用宿主机网络，6in4 包不经过 NAT |
 | `--cap-drop ALL --cap-add NET_RAW` | 只保留 raw socket 需要的权限 |
 | `--read-only` | 程序不写文件，根文件系统可以只读 |
-| `-v …:ro` | 挂载配置，只读即可 |
+| `--env-file .env` | 用环境变量配置；改用配置文件时换成 `-v /path/config.json:/etc/he-ipv6-pool/config.json:ro` |
 
 **为什么不能用 bridge 网络**：容器发出的协议 41 包要经过 Docker 的 MASQUERADE。协议 41 没有端口，conntrack 只按「本机 IP ↔ HE 服务器 IP」区分连接，同一对地址只能有一条记录。宿主机自己的 6in4 流量、上一个容器留下的记录（容器重建后 IP 变了）都会占用这个组合，新的包就会因为 NAT 冲突被丢弃。这条记录空闲 10 分钟才会过期，而 HE 不断发来的回包会一直刷新它。实测中 bridge 网络在宿主机刚停掉 6in4 服务后完全不通，手动 `conntrack -D -p 41` 删除旧记录后才恢复。
 
@@ -152,7 +166,7 @@ docker run --rm ghcr.io/x6nux/he-ipv6-pool:latest -version
 
 - 容器里没有管理命令。防火墙要在宿主机上自己放行：`iptables -I INPUT -p 41 -s <server_ipv4> -j ACCEPT`，以及 `listen` 的 TCP 端口
 - 同一台机器上不要同时运行 Docker 版和 `install` 安装的 systemd 服务：两个实例会同时收到所有协议 41 的包，各自的协议栈会把对方的连接当成未知连接并重置。从 systemd 换到 Docker 时先执行 `uninstall`，或者 `systemctl disable --now he-ipv6-pool`
-- 自己构建：`docker build --build-arg VERSION=v0.2.0 -t he-ipv6-pool .`；多架构：`docker buildx build --platform linux/amd64,linux/arm64 …`
+- 自己构建：`docker build --build-arg VERSION=v0.3.0 -t he-ipv6-pool .`；多架构：`docker buildx build --platform linux/amd64,linux/arm64 …`
 
 ---
 
@@ -179,6 +193,28 @@ docker run --rm ghcr.io/x6nux/he-ipv6-pool:latest -version
 | `users` | 对象 | 否 | 空 | 用户名 → 密码。为空时不要求认证，这时只应该监听回环地址，否则启动时会打印警告 |
 
 手动编辑配置时可以写多个用户；管理命令只维护其中一个。基础用户名不要包含 `-session-`、`-ip-`、`-ttl-`、`-cidr-`，否则会被当成后缀拆开，导致认证失败。
+
+### 2.1 环境变量
+
+每个环境变量对应一个配置字段，也和 `install` 的一个选项对应，解析和校验规则相同。**环境变量覆盖配置文件里的同名项**，没有设置的变量保持配置文件里的值；配置文件不存在、但设置了任何一个环境变量时，只用环境变量启动（适合容器部署）。
+
+| 环境变量 | 配置字段 | `install` 选项 | 说明 |
+|---|---|---|---|
+| `HE_SERVER` | `server_ipv4` | `-server` | 必填 |
+| `HE_PREFIXES` | `prefixes` | `-prefix` | 必填，多个用逗号分隔；设置后整体替换配置文件里的列表 |
+| `HE_LOCAL` | `local_ipv4` | `-local` | 设成空字符串表示清空 |
+| `HE_MTU` | `mtu` | `-mtu` | 整数，默认 1480 |
+| `PROXY_LISTEN` | `listen` | `-listen` | 必填 |
+| `PROXY_USER` | `users` | `-user` | 只设置用户名时沿用配置文件里的密码 |
+| `PROXY_PASS` | `users` | `-pass` | 只设置密码时沿用配置文件里的用户名 |
+
+```bash
+HE_SERVER=216.66.80.26 HE_PREFIXES=2001:db8:1::/64,2001:db8:abcd::/48 \
+PROXY_LISTEN=:24601 PROXY_USER=alice PROXY_PASS=$(openssl rand -hex 16) \
+sudo -E ./he-ipv6-pool
+```
+
+环境变量只能配置一个用户；需要多个用户时用配置文件。值不合法或者必填项缺失时，启动报错会指出是哪个环境变量。
 
 ---
 

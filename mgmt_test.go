@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 )
@@ -95,5 +96,46 @@ func TestFirewallRules(t *testing.T) {
 	cfg.Listen = "127.0.0.1:1080"
 	if got := firewallRules(cfg); len(got) != 1 {
 		t.Fatalf("监听回环地址时不应放行代理端口: %v", got)
+	}
+}
+
+// 环境变量覆盖配置文件里的同名项；没有设置的变量保持原值。
+func TestEnvConfig(t *testing.T) {
+	t.Setenv("HE_SERVER", "216.66.80.26")
+	t.Setenv("HE_PREFIXES", "2001:db8:1::/64,2001:db8:abcd::/48")
+	t.Setenv("HE_MTU", "1472")
+	t.Setenv("PROXY_LISTEN", ":24601")
+	t.Setenv("PROXY_PASS", "envpass")
+	cfg := config{LocalIPv4: netip.MustParseAddr("10.0.0.2"), Users: map[string]string{"alice": "filepass"}}
+	used, err := applyEnv(&cfg)
+	if err != nil || !used {
+		t.Fatalf("applyEnv: used=%v err=%v", used, err)
+	}
+	if cfg.ServerIPv4 != netip.MustParseAddr("216.66.80.26") || len(cfg.Prefixes) != 2 || cfg.MTU != 1472 || cfg.Listen != ":24601" {
+		t.Fatalf("环境变量没有生效: %+v", cfg)
+	}
+	if cfg.LocalIPv4 != netip.MustParseAddr("10.0.0.2") {
+		t.Fatalf("没有设置的 HE_LOCAL 不应改动原值: %s", cfg.LocalIPv4)
+	}
+	if u, p := firstUser(cfg.Users); u != "alice" || p != "envpass" {
+		t.Fatalf("只设置 PROXY_PASS 时应保留用户名: %q %q", u, p)
+	}
+
+	for name, bad := range map[string]string{"HE_SERVER": "2001:db8::1", "HE_PREFIXES": "10.0.0.0/8", "HE_MTU": "abc"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, bad)
+			if _, err := applyEnv(&config{}); err == nil || !strings.Contains(err.Error(), name) {
+				t.Errorf("%s=%q 应当报错并指出变量名，得到 %v", name, bad, err)
+			}
+		})
+	}
+}
+
+func TestEnvConfigUnset(t *testing.T) {
+	for _, k := range []string{"HE_SERVER", "HE_PREFIXES", "HE_LOCAL", "HE_MTU", "PROXY_LISTEN", "PROXY_USER", "PROXY_PASS"} {
+		os.Unsetenv(k)
+	}
+	if used, err := applyEnv(&config{}); used || err != nil {
+		t.Fatalf("没有环境变量时: used=%v err=%v", used, err)
 	}
 }

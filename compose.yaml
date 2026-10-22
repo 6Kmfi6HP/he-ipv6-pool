@@ -1,0 +1,20 @@
+# 用法：cp .env.example .env，按 HE 隧道详情页填好 .env，然后 docker compose up -d
+# 宿主机防火墙要放行来自 HE_SERVER 的协议 41 和 PROXY_LISTEN 的 TCP 端口（容器里没有 install 命令）
+services:
+  he-ipv6-pool:
+    image: ghcr.io/x6nux/he-ipv6-pool:${IMAGE_TAG:-latest}
+    container_name: he-ipv6-pool
+    restart: unless-stopped
+    # 必需：协议 41 没有端口，经过 Docker 的 NAT 会因为 conntrack 冲突丢包
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add: [NET_RAW]
+    read_only: true
+    environment:
+      HE_SERVER: ${HE_SERVER:?请在 .env 里填写 HE_SERVER（隧道详情页的 Server IPv4 Address）}
+      HE_PREFIXES: ${HE_PREFIXES:?请在 .env 里填写 HE_PREFIXES（Routed /64、/48，逗号分隔）}
+      HE_LOCAL: ${HE_LOCAL:-}
+      HE_MTU: ${HE_MTU:-1480}
+      PROXY_LISTEN: ${PROXY_LISTEN:?请在 .env 里填写 PROXY_LISTEN，例如 :24601}
+      PROXY_USER: ${PROXY_USER:?请在 .env 里填写 PROXY_USER}
+      PROXY_PASS: ${PROXY_PASS:?请在 .env 里填写 PROXY_PASS，可以用 openssl rand -hex 16 生成}

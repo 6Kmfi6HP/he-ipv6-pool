@@ -65,19 +65,28 @@ sudo /tmp/he-ipv6-pool install -server <Server IPv4> -prefix <Routed /64>,<Route
 
 选项：`-server`、`-prefix`（多个用逗号分隔）、`-local`、`-mtu`、`-listen`、`-user`、`-pass`，详见 `install -h` 或 [参数参考](docs/reference.md#12-install--config-的选项)。
 
-### 或者用 Docker
+### 或者用 Docker Compose
 
-镜像发布在 `ghcr.io/x6nux/he-ipv6-pool`（linux/amd64、linux/arm64，压缩后约 4MB）。参照 [`config.example.json`](config.example.json) 写好配置，把 `listen` 改成 `":端口"` 并设置 `users`，然后：
+镜像发布在 `ghcr.io/x6nux/he-ipv6-pool`（linux/amd64、linux/arm64，压缩后约 4MB），全部配置通过环境变量传入：
 
 ```bash
-docker run -d --name he-ipv6-pool --restart unless-stopped \
-  --network host --cap-drop ALL --cap-add NET_RAW --read-only \
-  -v /etc/he-ipv6-pool/config.json:/etc/he-ipv6-pool/config.json:ro \
-  ghcr.io/x6nux/he-ipv6-pool:latest
+mkdir he-ipv6-pool && cd he-ipv6-pool
+curl -fLO https://raw.githubusercontent.com/x6nux/he-ipv6-pool/main/compose.yaml
+curl -fL https://raw.githubusercontent.com/x6nux/he-ipv6-pool/main/.env.example -o .env
+vi .env              # 填写 HE_SERVER、HE_PREFIXES、PROXY_LISTEN、PROXY_USER、PROXY_PASS
+docker compose up -d
 ```
 
-- **必须用 `--network host`**：bridge 网络下，6in4 包要经过 Docker 的 NAT，协议 41 没有端口，只要宿主机上还有别的 6in4 流量或者容器换了 IP，就会因为 NAT 冲突而丢包
-- 容器里没有 `install`，防火墙要自己放行：`iptables -I INPUT -p 41 -s <Server IPv4> -j ACCEPT`，以及代理端口
+| 环境变量 | 说明 |
+|---|---|
+| `HE_SERVER` | 隧道详情页的 Server IPv4 Address（必填） |
+| `HE_PREFIXES` | Routed /64、/48，逗号分隔（必填） |
+| `PROXY_LISTEN` | 代理监听地址，例如 `:24601`（必填） |
+| `PROXY_USER` / `PROXY_PASS` | 代理用户名和密码（必填），密码可以用 `openssl rand -hex 16` 生成 |
+| `HE_LOCAL` / `HE_MTU` | 本地绑定的 IPv4（1:1 NAT 留空）、MTU（默认 1480） |
+
+- **必须用 host 网络**（compose 文件里已经写好）：bridge 网络下 6in4 包要经过 Docker 的 NAT，协议 41 没有端口，宿主机上有别的 6in4 流量或者容器换了 IP 时会因为 NAT 冲突而丢包
+- 容器里没有 `install`，宿主机防火墙要自己放行：`iptables -I INPUT -p 41 -s <Server IPv4> -j ACCEPT`，以及代理端口
 - 同一台机器上不要同时运行 Docker 版和 `install` 安装的服务：两个实例会互相重置对方的连接
 
 ## 3. 使用
@@ -104,7 +113,7 @@ curl -x http://<用户名>:<密码>@<服务器>:<端口> https://api64.ipify.org
 
 ## 4. 手动运行（macOS 或没有 systemd 的系统）
 
-复制 [`config.example.json`](config.example.json) 为 `config.json` 并按隧道详情页填写（字段说明见[参数参考](docs/reference.md#2-配置文件-configjson)），然后：
+复制 [`config.example.json`](config.example.json) 为 `config.json` 并按隧道详情页填写（字段说明见[参数参考](docs/reference.md#2-配置文件-configjson)），也可以不写配置文件，改用和 compose 相同的[环境变量](docs/reference.md#21-环境变量)。然后：
 
 ```bash
 sudo setcap cap_net_raw+ep ./he-ipv6-pool   # Linux；macOS 直接用 sudo 运行

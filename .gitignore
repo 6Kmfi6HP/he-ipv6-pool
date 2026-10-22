@@ -11,3 +11,6 @@ config.json
 .serena/
 .superpowers/
 .claude/
+
+# docker compose 的环境变量文件（含代理密码）
+.env

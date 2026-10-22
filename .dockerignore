@@ -7,3 +7,5 @@ config.json
 .serena
 .superpowers
 .claude
+.env
+compose.yaml

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"syscall"
 
 	"github.com/x6nux/he-ipv6-pool/proxy"
@@ -93,13 +94,61 @@ func loadConfig(path string) (config, error) {
 	return cfg, nil
 }
 
+// envVars 是环境变量与 install 选项的对应关系；环境变量覆盖配置文件里的同名项。
+var envVars = []struct{ name, flag string }{
+	{"HE_SERVER", "server"}, {"HE_PREFIXES", "prefix"}, {"HE_LOCAL", "local"}, {"HE_MTU", "mtu"},
+	{"PROXY_LISTEN", "listen"}, {"PROXY_USER", "user"}, {"PROXY_PASS", "pass"},
+}
+
+// applyEnv 用环境变量覆盖 cfg，解析和校验与 install 的同名选项相同；返回是否设置了任何变量。
+func applyEnv(cfg *config) (bool, error) {
+	used := false
+	for _, e := range envVars {
+		v, ok := os.LookupEnv(e.name)
+		if !ok {
+			continue
+		}
+		used = true
+		// apply 只读取 set 里那一项对应的字段，所以字符串字段都填 v
+		f := mgmtFlags{server: v, prefixes: v, local: v, listen: v, user: v, pass: v}
+		if e.flag == "mtu" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return used, fmt.Errorf("环境变量 %s=%q 不是整数", e.name, v)
+			}
+			f.mtu = n
+		}
+		if err := f.apply(cfg, map[string]bool{e.flag: true}); err != nil {
+			return used, fmt.Errorf("环境变量 %s: %w", e.name, err)
+		}
+	}
+	return used, nil
+}
+
+// run 读取配置文件并用环境变量覆盖；配置文件不存在但设置了环境变量时只用环境变量（适合容器部署）。
 func run(path string) error {
 	cfg, err := loadConfig(path)
-	if err != nil {
+	noFile := errors.Is(err, os.ErrNotExist)
+	if err != nil && !noFile {
 		return err
 	}
-	if cfg.Listen == "" {
-		return errors.New("配置缺少 listen")
+	used, envErr := applyEnv(&cfg)
+	switch {
+	case envErr != nil:
+		return envErr
+	case noFile && !used:
+		return fmt.Errorf("%w（也可以用环境变量 HE_SERVER、HE_PREFIXES、PROXY_LISTEN 等配置）", err)
+	case !cfg.ServerIPv4.Is4():
+		return errors.New("缺少 server_ipv4（环境变量 HE_SERVER）")
+	case len(cfg.Prefixes) == 0:
+		return errors.New("缺少 prefixes（环境变量 HE_PREFIXES）")
+	case cfg.Listen == "":
+		return errors.New("缺少 listen（环境变量 PROXY_LISTEN）")
+	}
+	for u, p := range cfg.Users {
+		if u == "" || p == "" {
+			return errors.New("代理用户名和密码都不能为空（环境变量 PROXY_USER、PROXY_PASS）")
+		}
 	}
 	t, err := tunnel.New(tunnel.Config{ServerIPv4: cfg.ServerIPv4, LocalIPv4: cfg.LocalIPv4, Prefixes: cfg.Prefixes, MTU: cfg.MTU})
 	if err != nil {
