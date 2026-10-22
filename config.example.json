@@ -1,0 +1,8 @@
+{
+  "server_ipv4": "216.66.80.26",
+  "local_ipv4": "",
+  "prefixes": ["2001:db8:1234::/64", "2001:db8:abcd::/48"],
+  "mtu": 1480,
+  "listen": "127.0.0.1:1080",
+  "users": {"alice": "change-me"}
+}
