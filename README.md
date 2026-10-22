@@ -65,6 +65,21 @@ sudo /tmp/he-ipv6-pool install -server <Server IPv4> -prefix <Routed /64>,<Route
 
 选项：`-server`、`-prefix`（多个用逗号分隔）、`-local`、`-mtu`、`-listen`、`-user`、`-pass`，详见 `install -h` 或 [参数参考](docs/reference.md#12-install--config-的选项)。
 
+### 或者用 Docker
+
+镜像发布在 `ghcr.io/x6nux/he-ipv6-pool`（linux/amd64、linux/arm64，压缩后约 4MB）。参照 [`config.example.json`](config.example.json) 写好配置，把 `listen` 改成 `":端口"` 并设置 `users`，然后：
+
+```bash
+docker run -d --name he-ipv6-pool --restart unless-stopped \
+  --network host --cap-drop ALL --cap-add NET_RAW --read-only \
+  -v /etc/he-ipv6-pool/config.json:/etc/he-ipv6-pool/config.json:ro \
+  ghcr.io/x6nux/he-ipv6-pool:latest
+```
+
+- **必须用 `--network host`**：bridge 网络下，6in4 包要经过 Docker 的 NAT，协议 41 没有端口，只要宿主机上还有别的 6in4 流量或者容器换了 IP，就会因为 NAT 冲突而丢包
+- 容器里没有 `install`，防火墙要自己放行：`iptables -I INPUT -p 41 -s <Server IPv4> -j ACCEPT`，以及代理端口
+- 同一台机器上不要同时运行 Docker 版和 `install` 安装的服务：两个实例会互相重置对方的连接
+
 ## 3. 使用
 
 ```bash

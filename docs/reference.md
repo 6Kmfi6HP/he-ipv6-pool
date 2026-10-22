@@ -118,6 +118,42 @@ systemctl status he-ipv6-pool      # 状态
 journalctl -u he-ipv6-pool -f      # 日志
 ```
 
+### 1.8 Docker
+
+镜像 `ghcr.io/x6nux/he-ipv6-pool`，支持 linux/amd64 和 linux/arm64，基于 `scratch`，里面只有一个静态二进制。默认命令是 `-c /etc/he-ipv6-pool/config.json`，把配置文件挂载到这个位置即可。
+
+| 镜像标签 | 说明 |
+|---|---|
+| `latest` | 最新正式版 |
+| `0.2.0` | 指定版本（标签名去掉 `v`） |
+| `0.2` | 0.2 系列的最新版本 |
+| `0.3.0-rc1` 等 | 预发布版本只打完整版本号，不会更新 `latest` 和 `0.3` |
+
+```bash
+docker run -d --name he-ipv6-pool --restart unless-stopped \
+  --network host --cap-drop ALL --cap-add NET_RAW --read-only \
+  -v /etc/he-ipv6-pool/config.json:/etc/he-ipv6-pool/config.json:ro \
+  ghcr.io/x6nux/he-ipv6-pool:latest
+
+docker logs -f he-ipv6-pool                              # 日志
+docker run --rm ghcr.io/x6nux/he-ipv6-pool:latest -version
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--network host` | **必需**。直接使用宿主机网络，6in4 包不经过 NAT |
+| `--cap-drop ALL --cap-add NET_RAW` | 只保留 raw socket 需要的权限 |
+| `--read-only` | 程序不写文件，根文件系统可以只读 |
+| `-v …:ro` | 挂载配置，只读即可 |
+
+**为什么不能用 bridge 网络**：容器发出的协议 41 包要经过 Docker 的 MASQUERADE。协议 41 没有端口，conntrack 只按「本机 IP ↔ HE 服务器 IP」区分连接，同一对地址只能有一条记录。宿主机自己的 6in4 流量、上一个容器留下的记录（容器重建后 IP 变了）都会占用这个组合，新的包就会因为 NAT 冲突被丢弃。这条记录空闲 10 分钟才会过期，而 HE 不断发来的回包会一直刷新它。实测中 bridge 网络在宿主机刚停掉 6in4 服务后完全不通，手动 `conntrack -D -p 41` 删除旧记录后才恢复。
+
+**其他注意事项：**
+
+- 容器里没有管理命令。防火墙要在宿主机上自己放行：`iptables -I INPUT -p 41 -s <server_ipv4> -j ACCEPT`，以及 `listen` 的 TCP 端口
+- 同一台机器上不要同时运行 Docker 版和 `install` 安装的 systemd 服务：两个实例会同时收到所有协议 41 的包，各自的协议栈会把对方的连接当成未知连接并重置。从 systemd 换到 Docker 时先执行 `uninstall`，或者 `systemctl disable --now he-ipv6-pool`
+- 自己构建：`docker build --build-arg VERSION=v0.2.0 -t he-ipv6-pool .`；多架构：`docker buildx build --platform linux/amd64,linux/arm64 …`
+
 ---
 
 ## 2. 配置文件 config.json
@@ -339,6 +375,8 @@ SOCKS=127.0.0.1:<端口> PROXY_USER=<用户名> PROXY_PASS=<密码> ./check-pref
 | `he-ipv6-pool-linux-amd64` / `-arm64` / `-arm` / `-386` / `-riscv64` | Linux |
 | `he-ipv6-pool-darwin-amd64` / `-arm64` | macOS（只能前台运行，没有管理命令；还没有在真实隧道上验证过） |
 | `SHA256SUMS` | 校验和 |
+
+同时会构建 linux/amd64 和 linux/arm64 的 Docker 镜像推送到 `ghcr.io/x6nux/he-ipv6-pool`，镜像标签见 [1.8](#18-docker)；镜像任务在测试和版本号校验通过后才会运行。
 
 二进制是静态编译的（`CGO_ENABLED=0`）。`he-ipv6-pool -version` 显示版本，`install` 和 `config` 打印的信息里也有版本：
 

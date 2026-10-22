@@ -1,4 +1,4 @@
-# 测试、交叉编译并发布到 GitHub Release。两种发版方式：
+# 测试、交叉编译并发布到 GitHub Release，同时推送多架构 Docker 镜像到 ghcr.io。两种发版方式：
 #   1. 推送标签：git tag v0.1.0 && git push origin v0.1.0
 #   2. 手动触发：Actions 页面选 release → Run workflow → 填版本号；或者 gh workflow run release.yml -f version=v0.1.0
 #      会在所选分支的最新提交上创建标签
@@ -48,7 +48,7 @@ jobs:
             GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -trimpath \
               -ldflags "-s -w -X main.version=$TAG" -o "dist/he-ipv6-pool-${target%/*}-${target#*/}" .
           done
-          cd dist && sha256sum * > SHA256SUMS
+          cd dist && sha256sum -- * > SHA256SUMS
       - name: release
         run: |
           prerelease=""
@@ -56,3 +56,38 @@ jobs:
           gh release create "$TAG" dist/* --target "$GITHUB_SHA" --generate-notes $prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # 镜像发布放在同一个工作流里：手动触发时标签由 GITHUB_TOKEN 创建，不会再触发别的工作流；
+  # needs 保证测试通过、版本号校验通过后才推送
+  docker:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          # v1.2.3 → 1.2.3、1.2；正式版额外打 latest，预发布版只打完整版本号
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=raw,value=latest,enable=${{ !contains(env.TAG, '-') }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ env.TAG }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
