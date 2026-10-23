@@ -154,11 +154,12 @@ client := &http.Client{Transport: &http.Transport{
 
 | 现象 | 原因和处理 |
 |---|---|
-| 部分随机连接超时，或者某些会话一直失败 | 有前缀没有被 HE 路由到这条隧道。从任意有 IPv6 的机器 `ping -6` 每个前缀里的地址，已路由的会有回复；或者 `tcpdump -ni <网卡> 'ip proto 41 and host <Server IPv4>'` 看出站包有没有回包 |
+| 部分随机连接超时，或者某些会话一直失败 | 有前缀没有被 HE 路由到这条隧道。启动日志里会逐个前缀报告「隧道检查通过 / 失败」；也可以从任意有 IPv6 的机器 `ping -6` 每个前缀里的地址，已路由的会有回复 |
 | 新分配的 /48 不通 | HE 的新前缀偶尔要过一段时间才生效，可以用 `scripts/check-prefix.sh` 定时检查（见[参数参考](docs/reference.md#6-scriptscheck-prefixsh)）。长时间不通就换一个欧美隧道服务器重建 |
 | 所有连接都不通 | 检查安全组是否放行了协议 41；是否同时启用了内核的 HE 隧道（`iface he-ipv6 inet6 v4tunnel`），有的话先 `ifdown he-ipv6`，仍有问题再 `modprobe -r sit` |
 | 同一个会话高并发时出现 429 或超时 | 目标网站按 IP 限流。同一个会话的所有请求共用一个 IP，换成不带会话的 `-cidr-64`，或者降低每个会话的并发 |
 | 只有 IPv4 的网站打不开 | 本程序只出 IPv6，不会回退到 IPv4 |
+| 想看每个请求的出口 IP 和失败原因 | 设置 `LOG_LEVEL=debug`（或 `-v`），每个请求输出一行；平时每 10 分钟输出一次统计。见[日志说明](docs/reference.md#19-日志与启动检查) |
 
 ## 7. 限制
 

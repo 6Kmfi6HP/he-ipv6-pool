@@ -2,10 +2,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -14,6 +16,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/x6nux/he-ipv6-pool/proxy"
 	"github.com/x6nux/he-ipv6-pool/tunnel"
@@ -54,7 +57,7 @@ func main() {
 		}
 	}
 	path := flag.String("c", "config.json", "配置文件路径")
-	verbose := flag.Bool("v", false, "输出 debug 日志")
+	verbose := flag.Bool("v", false, "输出 debug 日志（每个请求一行），等同于环境变量 LOG_LEVEL=debug")
 	showVersion := flag.Bool("version", false, "显示版本")
 	flag.Usage = func() {
 		fmt.Fprint(flag.CommandLine.Output(), `用法:
@@ -73,13 +76,33 @@ func main() {
 		fmt.Println(versionString())
 		return
 	}
-	if *verbose {
-		slog.SetLogLoggerLevel(slog.LevelDebug)
+	if err := setupLog(*verbose); err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		os.Exit(1)
 	}
 	if err := run(*path); err != nil {
 		slog.Error("退出", "err", err)
 		os.Exit(1)
 	}
+}
+
+// setupLog 按 -v 或环境变量 LOG_LEVEL（debug、info、warn、error）设置日志级别，-v 优先；
+// 在 systemd 下运行时（journald 会设置 JOURNAL_STREAM）不输出时间，journald 自己会记录。
+func setupLog(verbose bool) error {
+	if os.Getenv("JOURNAL_STREAM") != "" {
+		log.SetFlags(0)
+	}
+	level := slog.LevelInfo
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		if err := level.UnmarshalText([]byte(v)); err != nil {
+			return fmt.Errorf("环境变量 LOG_LEVEL=%q 无效，可选 debug、info、warn、error", v)
+		}
+	}
+	if verbose {
+		level = slog.LevelDebug
+	}
+	slog.SetLogLoggerLevel(level)
+	return nil
 }
 
 func loadConfig(path string) (config, error) {
@@ -163,11 +186,13 @@ func run(path string) error {
 	if len(cfg.Users) == 0 && !l.Addr().(*net.TCPAddr).IP.IsLoopback() {
 		slog.Warn("监听非回环地址且没有配置 users，任何人都可以使用这个代理", "listen", l.Addr())
 	}
-	slog.Info("隧道已启动", "server", cfg.ServerIPv4, "prefixes", cfg.Prefixes)
-	slog.Info("代理已启动", "listen", l.Addr(), "protocols", "socks5+http")
+	slog.Info("已启动", startupAttrs(cfg, l.Addr())...)
 
+	p := &proxy.Proxy{Tunnel: t, Users: cfg.Users}
 	errc := make(chan error, 1)
-	go func() { errc <- (&proxy.Proxy{Tunnel: t, Users: cfg.Users}).Serve(l) }()
+	go func() { errc <- p.Serve(l) }()
+	go checkTunnel(t, cfg.ServerIPv4)
+	go logStats(p, statsInterval)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	select {
@@ -176,5 +201,62 @@ func run(path string) error {
 		return nil
 	case err := <-errc:
 		return err
+	}
+}
+
+func startupAttrs(cfg config, listen net.Addr) []any {
+	local, mtu, auth := "自动", cfg.MTU, "关闭"
+	if cfg.LocalIPv4.IsValid() {
+		local = cfg.LocalIPv4.String()
+	}
+	if mtu == 0 {
+		mtu = 1480
+	}
+	if n := len(cfg.Users); n > 0 {
+		auth = fmt.Sprintf("%d 个用户", n)
+	}
+	return []any{"version", versionString(), "server", cfg.ServerIPv4, "local", local, "mtu", mtu,
+		"prefixes", cfg.Prefixes, "listen", listen, "protocols", "socks5+http", "auth", auth}
+}
+
+// checkTargets 是启动检查连接的目标：Cloudflare 和 Google 公共 DNS 的 IPv6 任播地址，长期稳定。
+var checkTargets = []netip.AddrPort{
+	netip.MustParseAddrPort("[2606:4700:4700::1111]:443"),
+	netip.MustParseAddrPort("[2001:4860:4860::8888]:443"),
+}
+
+// checkTunnel 检查每个前缀能否收到回包。结果只写日志，不影响服务运行：HE 临时故障时
+// 退出会让 systemd 不停重启；也不剔除不通的前缀，否则所有会话的固定 IP 都会变。
+func checkTunnel(t *tunnel.Tunnel, server netip.Addr) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ok := 0
+	for _, r := range t.Check(ctx, checkTargets) {
+		if r.Err != nil {
+			slog.Warn("隧道检查失败：这个前缀收不到回包，可能还没有被 HE 路由到这条隧道", "prefix", r.Prefix, "src", r.Src, "err", r.Err)
+			continue
+		}
+		ok++
+		slog.Info("隧道检查通过", "prefix", r.Prefix, "src", r.Src, "rtt", r.RTT.Round(time.Millisecond))
+	}
+	if ok == 0 {
+		slog.Error("所有前缀都不通：请确认防火墙和云厂商安全组放行了来自 HE 的协议 41，"+
+			"HE 后台填写的 IPv4 端点是本机的公网 IP，并且没有同时启用内核的 HE 隧道", "server", server)
+	}
+}
+
+const statsInterval = 10 * time.Minute
+
+// logStats 每隔 interval 输出一次这段时间的请求统计；没有任何活动时不输出。
+func logStats(p *proxy.Proxy, interval time.Duration) {
+	var prev proxy.Stats
+	for range time.Tick(interval) {
+		s := p.Stats()
+		d := s.Sub(prev)
+		prev = s
+		if d.Requests() == 0 && s.Active == 0 {
+			continue
+		}
+		slog.Info(fmt.Sprintf("最近 %d 分钟", int(interval.Minutes())), d.Attrs()...)
 	}
 }

@@ -25,6 +25,7 @@ type Proxy struct {
 	Users  map[string]string // 用户名 → 密码；为空时不要求认证
 
 	sessions sessions // 带 -ttl- 或 -cidr- 的会话
+	stats    stats
 }
 
 // source 校验密码并按用户名里的后缀选出源地址（零值表示由隧道随机选）。
@@ -154,10 +155,12 @@ func parseSelector(username string) (sel selector, err error) {
 // 发完请求就半关闭，但还要收完响应）；支持 CloseWrite 的类型目前只有
 // *net.TCPConn 和 gonet 的 *TCPConn，不支持时退化为整个关闭。一个方向出错时
 // 直接关闭两端，解除另一个方向的阻塞。两个方向都结束后再关闭两端收尾。
-func relay(a, b net.Conn) {
+// 返回 a→b 和 b→a 两个方向各自转发的字节数。
+func relay(a, b net.Conn) (ab, ba int64) {
 	done := make(chan struct{}, 2)
-	cp := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
+	cp := func(dst, src net.Conn, n *int64) {
+		var err error
+		*n, err = io.Copy(dst, src)
 		if err == nil {
 			if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 				cw.CloseWrite()
@@ -170,10 +173,11 @@ func relay(a, b net.Conn) {
 		}
 		done <- struct{}{}
 	}
-	go cp(a, b)
-	go cp(b, a)
+	go cp(a, b, &ba)
+	go cp(b, a, &ab)
 	<-done
 	<-done
 	a.Close()
 	b.Close()
+	return ab, ba
 }

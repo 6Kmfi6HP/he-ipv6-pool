@@ -3,16 +3,20 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,7 +133,7 @@ func get(t *testing.T, proxyURL string) (int, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}, Timeout: 5 * time.Second}
+	c := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u), DisableKeepAlives: true}, Timeout: 5 * time.Second}
 	resp, err := c.Get("http://[2001:db8:ffff::1]/")
 	if err != nil {
 		return 0, err.Error()
@@ -457,5 +461,87 @@ func TestHTTPConnect(t *testing.T) {
 	buf := make([]byte, 5)
 	if _, err := io.ReadFull(br, buf); err != nil || string(buf) != "hello" {
 		t.Fatalf("echo: %q %v", buf, err)
+	}
+}
+
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		err  error
+		want failKind
+	}{
+		{nil, kindOK},
+		{errAuth, kindAuth},
+		{fmt.Errorf("x: %w", tunnel.ErrNotInPool), kindRejected},
+		{fmt.Errorf("%w: example.com", tunnel.ErrNoIPv6), kindNoIPv6},
+		{errors.New("connection was refused"), kindRefused},
+		{context.DeadlineExceeded, kindTimeout},
+		{&net.OpError{Op: "connect", Err: errors.New("operation timed out")}, kindTimeout},
+		{io.ErrUnexpectedEOF, kindOther},
+	}
+	for _, c := range cases {
+		if got := classify(c.err); got != c.want {
+			t.Errorf("classify(%v) = %s，期望 %s", c.err, got, c.want)
+		}
+	}
+}
+
+// lockedBuffer 是并发安全的日志缓冲区。
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// 每个请求结束时计入统计，并在 debug 级别输出一行；日志里不能出现密码。
+func TestRequestLog(t *testing.T) {
+	var logs lockedBuffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	local, p := setup(t, map[string]string{"alice": "secret-pw"})
+	addr := serveProxy(t, p)
+	if code, body := get(t, "socks5://alice-session-z:secret-pw@"+addr); code != 200 || !local.Contains(netip.MustParseAddr(body)) {
+		t.Fatalf("socks5: %d %s", code, body)
+	}
+	if code, _ := get(t, "http://alice:secret-pw@"+addr); code != 200 {
+		t.Fatalf("http: %d", code)
+	}
+	get(t, "http://alice:wrong@"+addr)
+	get(t, "socks5://alice-ip-2001-db8-2--1:secret-pw@"+addr)
+
+	// 转发在客户端关闭连接后才结束，统计是异步更新的
+	deadline := time.Now().Add(3 * time.Second)
+	var s Stats
+	for {
+		s = p.Stats()
+		if s.Requests() >= 4 && s.Active == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if s.Count[kindOK] != 2 || s.Count[kindAuth] != 1 || s.Count[kindRejected] != 1 || s.Active != 0 || s.Up == 0 || s.Down == 0 {
+		t.Fatalf("统计不对: %+v", s)
+	}
+
+	out := logs.String()
+	if strings.Contains(out, "secret-pw") {
+		t.Fatalf("日志里出现了密码:\n%s", out)
+	}
+	for _, want := range []string{"proto=socks5 ", "user=alice-session-z", "dst=[2001:db8:ffff::1]:80", "src=2001:db8:1:", "proto=http ", "result=auth", "result=rejected"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("日志缺少 %q:\n%s", want, out)
+		}
 	}
 }

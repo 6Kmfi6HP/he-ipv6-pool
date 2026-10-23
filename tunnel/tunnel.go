@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -317,6 +319,58 @@ func (t *Tunnel) ListenTCP(addr netip.AddrPort) (net.Listener, error) {
 		return nil, err
 	}
 	return l, nil
+}
+
+// PrefixCheck 是 Check 对一个前缀的检查结果。
+type PrefixCheck struct {
+	Prefix netip.Prefix
+	Src    netip.Addr    // 检查用的源地址
+	RTT    time.Duration // 从发起连接到收到回应的耗时，Err 不为 nil 时为 0
+	Err    error         // nil 表示去程和回程都通
+}
+
+// Check 从每个前缀里取一个随机地址，并发地向 targets 发起 TCP 连接：任意一个连上或者被拒绝
+// （收到 RST 也说明回包到了）就算这个前缀可用；直到 ctx 结束都没有回应，通常是 HE 没有把
+// 这个前缀路由到隧道，或者防火墙挡住了协议 41。结果按前缀的配置顺序排列。
+func (t *Tunnel) Check(ctx context.Context, targets []netip.AddrPort) []PrefixCheck {
+	res := make([]PrefixCheck, len(t.pool))
+	var wg sync.WaitGroup
+	for i, pfx := range t.pool {
+		res[i] = PrefixCheck{Prefix: pfx, Src: randomIn(pfx)}
+		wg.Add(1)
+		go func(r *PrefixCheck) {
+			defer wg.Done()
+			r.RTT, r.Err = t.probe(ctx, r.Src, targets)
+		}(&res[i])
+	}
+	wg.Wait()
+	return res
+}
+
+// probe 以 src 为源地址同时连接所有 targets，返回第一个回应的耗时。
+func (t *Tunnel) probe(ctx context.Context, src netip.Addr, targets []netip.AddrPort) (time.Duration, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	start := time.Now()
+	errc := make(chan error, len(targets))
+	for _, dst := range targets {
+		go func() {
+			c, err := t.Dial(ctx, src, "tcp", dst.String())
+			if err == nil {
+				c.Close()
+			} else if strings.Contains(err.Error(), "refused") { // gonet 把 tcpip 错误转成了纯文本
+				err = nil
+			}
+			errc <- err
+		}()
+	}
+	err := errors.New("tunnel: 没有检查目标")
+	for range targets {
+		if err = <-errc; err == nil {
+			return time.Since(start), nil
+		}
+	}
+	return 0, err
 }
 
 // RandomAddr 返回池内随机地址。

@@ -18,3 +18,4 @@ services:
       PROXY_LISTEN: ${PROXY_LISTEN:?请在 .env 里填写 PROXY_LISTEN，例如 :24601}
       PROXY_USER: ${PROXY_USER:?请在 .env 里填写 PROXY_USER}
       PROXY_PASS: ${PROXY_PASS:?请在 .env 里填写 PROXY_PASS，可以用 openssl rand -hex 16 生成}
+      LOG_LEVEL: ${LOG_LEVEL:-info}

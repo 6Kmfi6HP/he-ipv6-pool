@@ -261,3 +261,63 @@ func TestDropForeign(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// dropTo 丢掉目的地址在 drop 里的入站包，模拟 HE 没有把这个前缀路由到隧道。
+type dropTo struct {
+	net.PacketConn
+	drop netip.Prefix
+}
+
+func (d dropTo) ReadFrom(b []byte) (int, net.Addr, error) {
+	for {
+		n, a, err := d.PacketConn.ReadFrom(b)
+		if err == nil && n >= 40 && d.drop.Contains(netip.AddrFrom16([16]byte(b[24:40]))) {
+			continue
+		}
+		return n, a, err
+	}
+}
+
+func TestCheck(t *testing.T) {
+	routed, unrouted := netip.MustParsePrefix("2001:db8:1::/48"), netip.MustParsePrefix("2001:db8:2::/48")
+	a, b := listenUDP(t), listenUDP(t)
+	local, err := NewWithConn(Config{Prefixes: []netip.Prefix{routed, unrouted}}, dropTo{a, unrouted}, b.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote, err := NewWithConn(Config{Prefixes: []netip.Prefix{remotePrefix}}, b, a.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { local.Close(); remote.Close() })
+	ln, err := remote.ListenTCP(netip.AddrPortFrom(remoteAddr, 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	// 443 有监听；444 没有监听，对端回 RST，同样说明来回都通
+	for _, port := range []uint16{443, 444} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		res := local.Check(ctx, []netip.AddrPort{netip.AddrPortFrom(remoteAddr, port)})
+		cancel()
+		if len(res) != 2 || res[0].Prefix != routed || res[1].Prefix != unrouted {
+			t.Fatalf("端口 %d: 结果应当按前缀顺序排列: %+v", port, res)
+		}
+		if r := res[0]; r.Err != nil || !routed.Contains(r.Src) || r.RTT <= 0 {
+			t.Errorf("端口 %d: 已路由的前缀应当通过: %+v", port, r)
+		}
+		if r := res[1]; r.Err == nil || !unrouted.Contains(r.Src) {
+			t.Errorf("端口 %d: 收不到回包的前缀应当失败: %+v", port, r)
+		}
+	}
+}

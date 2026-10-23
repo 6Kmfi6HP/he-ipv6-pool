@@ -31,7 +31,7 @@ he-ipv6-pool uninstall                                          卸载
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `-c <路径>` | `config.json` | 配置文件路径，格式见[第 2 节](#2-配置文件-configjson)。也可以只用[环境变量](#21-环境变量)配置，这时配置文件可以不存在 |
-| `-v` | 关 | 输出 debug 日志（每个失败连接的原因等） |
+| `-v` | 关 | 输出 debug 日志（每个请求一行），等同于环境变量 `LOG_LEVEL=debug`，见 [1.9](#19-日志与启动检查) |
 | `-version` | — | 打印版本号后退出。发布版是标签名（如 `v1.0.0`），自己编译的是 `dev` |
 
 需要 root 或 `CAP_NET_RAW`（推荐 `sudo setcap cap_net_raw+ep ./he-ipv6-pool` 后用普通用户运行）。收到 SIGINT 或 SIGTERM 时关闭监听和隧道后退出。
@@ -168,6 +168,56 @@ docker run --rm ghcr.io/x6nux/he-ipv6-pool:latest -version
 - 同一台机器上不要同时运行 Docker 版和 `install` 安装的 systemd 服务：两个实例会同时收到所有协议 41 的包，各自的协议栈会把对方的连接当成未知连接并重置。从 systemd 换到 Docker 时先执行 `uninstall`，或者 `systemctl disable --now he-ipv6-pool`
 - 自己构建：`docker build --build-arg VERSION=v0.3.0 -t he-ipv6-pool .`；多架构：`docker buildx build --platform linux/amd64,linux/arm64 …`
 
+### 1.9 日志与启动检查
+
+日志写到标准错误。在 systemd 下运行时不带时间戳（journald 会记录时间），用 `journalctl -u he-ipv6-pool -f` 查看；Docker 用 `docker compose logs -f`。
+
+| 日志 | 级别 | 内容 |
+|---|---|---|
+| `已启动` | info | 版本、HE 服务器、本地绑定地址、MTU、前缀、监听地址、认证（几个用户） |
+| `隧道检查通过` / `隧道检查失败` | info / warn | 每个前缀一行，见下文 |
+| `所有前缀都不通` | error | 所有前缀都检查失败时额外输出，提示检查协议 41 的放行和 IPv4 端点 |
+| `最近 10 分钟` | info | 每 10 分钟一行请求统计，没有任何活动时不输出 |
+| `请求完成` / `请求失败` | debug | 每个请求一行，需要 `-v` 或 `LOG_LEVEL=debug` |
+
+**启动检查**：启动后在后台从每个前缀各取一个随机地址，同时连接 `[2606:4700:4700::1111]:443`（Cloudflare）和 `[2001:4860:4860::8888]:443`（Google），5 秒内任意一个连上或者被拒绝（收到 RST 也说明回包到了）就算这个前缀可用。
+
+```
+INFO 隧道检查通过 prefix=2001:db8:1::/64 src=2001:db8:1:0:6dc7:e2d3:ce58:cdcc rtt=232ms
+WARN 隧道检查失败：这个前缀收不到回包，可能还没有被 HE 路由到这条隧道 prefix=2001:db8:abcd::/48 …
+```
+
+检查结果只写日志，不会让服务退出（HE 临时故障时退出会让 systemd 不停重启），也不会剔除不通的前缀（剔除后前缀数量变了，所有会话的固定 IP 都会变）。某个前缀一直不通时，把它从 `prefixes` 里删掉，或者换一个隧道服务器重建。
+
+**定时统计**：
+
+```
+INFO 最近 10 分钟 requests=1532 ok=1490 no_ipv6=30 timeout=12 active=87 up=12.3MiB down=845.1MiB
+```
+
+| 字段 | 含义 |
+|---|---|
+| `requests` | 这段时间结束的请求数（SOCKS5 连接、UDP 关联、HTTP CONNECT、HTTP 转发各算一个；长连接在关闭时才计入） |
+| `ok` | 成功 |
+| `auth` | 用户名或密码错误 |
+| `rejected` | 用户名后缀不合法，或者指定的出口地址不在池内 |
+| `no_ipv6` | 目标没有 IPv6 地址，或者 DNS 解析失败 |
+| `refused` / `timeout` | 目标拒绝连接 / 连接目标超时 |
+| `other` | 其他错误，例如客户端中途断开 |
+| `active` | 当前正在转发的连接数 |
+| `up` / `down` | 客户端发往目标 / 目标发回客户端的流量 |
+
+只列出非零的分类。客户端在认证之前就断开或者发来无效数据（例如端口扫描）不计入统计，只在 debug 级别记录 `socks5 握手失败`。
+
+**每个请求的日志**（debug）：
+
+```
+DEBUG 请求完成 proto=socks5 client=203.0.113.7:59128 user=alice-session-x dst=example.com:443 src=2001:db8:abcd::1 dur=2.7s up=592 down=4971
+DEBUG 请求失败 proto=http client=203.0.113.7:59148 user=alice dst=example.com result=auth err="proxy: 认证失败"
+```
+
+`proto` 是 `socks5`、`socks5-udp`、`http-connect` 或 `http`；`user` 是完整用户名（含后缀），**不记录密码**；`src` 是实际使用的出口地址；`up`、`down` 是字节数；失败时 `result` 是上表中的分类。
+
 ---
 
 ## 2. 配置文件 config.json
@@ -207,6 +257,7 @@ docker run --rm ghcr.io/x6nux/he-ipv6-pool:latest -version
 | `PROXY_LISTEN` | `listen` | `-listen` | 必填 |
 | `PROXY_USER` | `users` | `-user` | 只设置用户名时沿用配置文件里的密码 |
 | `PROXY_PASS` | `users` | `-pass` | 只设置密码时沿用配置文件里的用户名 |
+| `LOG_LEVEL` | — | — | 日志级别：`debug`、`info`（默认）、`warn`、`error`，见 [1.9](#19-日志与启动检查) |
 
 ```bash
 HE_SERVER=216.66.80.26 HE_PREFIXES=2001:db8:1::/64,2001:db8:abcd::/48 \

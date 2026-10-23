@@ -468,5 +468,6 @@ HE 服务器 %s
 用户名后缀选择出口（可以组合）：-session-<id> 固定 IP，-ttl-<分钟> 固定 IP 的生存时间，
 -cidr-64 按 /64 轮换；-ip-<地址> 指定 IP（地址里的 : 写成 -）。
 云厂商的安全组还需要放行协议 41 和 TCP %[9]s。
+日志：journalctl -u he-ipv6-pool -f（启动时会逐个检查前缀是否可用）
 `, versionString(), installConf, cfg.ServerIPv4, cfg.Prefixes, cfg.Listen, user, pass, addr, port)
 }

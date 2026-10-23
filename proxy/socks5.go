@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -35,18 +34,27 @@ const (
 	repAtypUnsupported = 8
 )
 
-func (p *Proxy) socks5(c net.Conn) error {
+// socks5 处理一个 SOCKS5 连接。返回的错误只包括认证之前的握手错误；
+// 认证之后的结果都交给 finish 计入统计和日志。
+func (p *Proxy) socks5(c net.Conn) (err error) {
 	c.SetDeadline(time.Now().Add(dialTimeout)) // 握手超时，进入转发前清除
-	src, srcErr := p.socksAuth(c)
-	if srcErr != nil && !errors.Is(srcErr, tunnel.ErrNotInPool) {
+	rec := newRequest("socks5", c.RemoteAddr().String())
+	src, srcErr := p.socksAuth(c, rec)
+	switch {
+	case errors.Is(srcErr, errAuth):
+		p.finish(rec, srcErr)
+		return nil
+	case srcErr != nil && !errors.Is(srcErr, tunnel.ErrNotInPool):
 		return srcErr
 	}
+	defer func() { p.finish(rec, err); err = nil }()
 	// 请求：VER CMD RSV ATYP DST.ADDR DST.PORT
 	var h [3]byte
 	if _, err := io.ReadFull(c, h[:]); err != nil {
 		return err
 	}
 	dst, err := readAddr(c)
+	rec.dst = dst
 	if err != nil {
 		writeReply(c, repAtypUnsupported, netip.AddrPort{})
 		return err
@@ -57,17 +65,18 @@ func (p *Proxy) socks5(c net.Conn) error {
 	}
 	switch h[1] {
 	case cmdConnect:
-		return p.socksConnect(c, src, dst)
+		return p.socksConnect(c, src, rec)
 	case cmdAssociate:
-		return p.socksAssociate(c, src)
+		rec.proto = "socks5-udp"
+		return p.socksAssociate(c, src, rec)
 	}
 	writeReply(c, repCmdUnsupported, netip.AddrPort{})
 	return fmt.Errorf("不支持的命令 %d", h[1])
 }
 
-// socksAuth 完成方法协商和认证（RFC 1928 §3、RFC 1929），返回源地址。
+// socksAuth 完成方法协商和认证（RFC 1928 §3、RFC 1929），返回源地址，用户名记到 rec。
 // 返回 tunnel.ErrNotInPool 表示认证通过但显式 IP 无效，留到请求阶段回复 0x02。
-func (p *Proxy) socksAuth(c net.Conn) (netip.Addr, error) {
+func (p *Proxy) socksAuth(c net.Conn, rec *request) (netip.Addr, error) {
 	var h [2]byte
 	if _, err := io.ReadFull(c, h[:]); err != nil {
 		return netip.Addr{}, err
@@ -89,6 +98,7 @@ func (p *Proxy) socksAuth(c net.Conn) (netip.Addr, error) {
 		if err != nil {
 			return netip.Addr{}, err
 		}
+		rec.user = user
 		src, err := p.source(user, pass)
 		if errors.Is(err, errAuth) {
 			c.Write([]byte{1, 1})
@@ -187,41 +197,44 @@ func writeReply(w io.Writer, rep byte, bind netip.AddrPort) error {
 
 // dialReply 把拨号错误映射成 SOCKS5 应答码。
 func dialReply(err error) byte {
-	switch {
-	case errors.Is(err, tunnel.ErrNotInPool):
+	switch classify(err) {
+	case kindRejected:
 		return repNotAllowed
-	case errors.Is(err, tunnel.ErrNoIPv6):
+	case kindNoIPv6:
 		return repHostUnreach
-	case strings.Contains(err.Error(), "refused"): // gonet 把 tcpip 错误转成了纯文本，只能按文本匹配
+	case kindRefused:
 		return repRefused
 	}
 	return repFail
 }
 
-func (p *Proxy) socksConnect(c net.Conn, src netip.Addr, dst string) error {
+func (p *Proxy) socksConnect(c net.Conn, src netip.Addr, rec *request) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	up, err := p.Tunnel.Dial(ctx, src, "tcp", dst)
+	up, err := p.Tunnel.Dial(ctx, src, "tcp", rec.dst)
 	if err != nil {
 		writeReply(c, dialReply(err), netip.AddrPort{})
 		return err
 	}
 	defer up.Close()
 	bind, _ := netip.ParseAddrPort(up.LocalAddr().String())
+	rec.src = bind.Addr()
 	if err := writeReply(c, repOK, bind); err != nil {
 		return err
 	}
 	c.SetDeadline(time.Time{})
-	relay(c, up)
+	defer p.active()()
+	rec.up, rec.down = relay(c, up)
 	return nil
 }
 
 // socksAssociate 处理 UDP ASSOCIATE（RFC 1928 §7）：本地 UDP socket 与客户端通信，
 // 隧道侧 UDP socket 以 src 为源地址与目标通信，控制连接断开时一并关闭。
-func (p *Proxy) socksAssociate(c net.Conn, src netip.Addr) error {
+func (p *Proxy) socksAssociate(c net.Conn, src netip.Addr, rec *request) error {
 	if !src.IsValid() {
 		src = p.Tunnel.RandomAddr()
 	}
+	rec.src = src
 	out, err := p.Tunnel.ListenUDP(netip.AddrPortFrom(src, 0))
 	if err != nil {
 		writeReply(c, dialReply(err), netip.AddrPort{})
@@ -242,6 +255,8 @@ func (p *Proxy) socksAssociate(c net.Conn, src netip.Addr) error {
 
 	clientIP := c.RemoteAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()
 	var client atomic.Pointer[net.UDPAddr] // 客户端最近一次发包的地址
+	var up, down atomic.Int64
+	defer p.active()()
 
 	go func() { // 目标 → 客户端
 		buf := make([]byte, 65535)
@@ -253,6 +268,7 @@ func (p *Proxy) socksAssociate(c net.Conn, src netip.Addr) error {
 			if to := client.Load(); to != nil {
 				pkt := appendAddr([]byte{0, 0, 0}, from.(*net.UDPAddr).AddrPort())
 				in.WriteToUDP(append(pkt, buf[:n]...), to)
+				down.Add(int64(n))
 			}
 		}
 	}()
@@ -278,8 +294,10 @@ func (p *Proxy) socksAssociate(c net.Conn, src netip.Addr) error {
 			}
 			client.Store(from)
 			out.WriteTo(buf[n-r.Len():n], net.UDPAddrFromAddrPort(ap))
+			up.Add(int64(r.Len()))
 		}
 	}()
 	io.Copy(io.Discard, c) // 阻塞到控制连接断开
+	rec.up, rec.down = up.Load(), down.Load()
 	return nil
 }

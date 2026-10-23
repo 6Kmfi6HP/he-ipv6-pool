@@ -12,11 +12,14 @@ import (
 type pool []netip.Prefix
 
 // random 先均匀选一个前缀，再随机填充主机位。
-func (p pool) random() netip.Addr {
+func (p pool) random() netip.Addr { return randomIn(p[rand.IntN(len(p))]) }
+
+// randomIn 返回 pfx 内主机位随机的地址。
+func randomIn(pfx netip.Prefix) netip.Addr {
 	var host [16]byte
 	binary.BigEndian.PutUint64(host[:8], rand.Uint64())
 	binary.BigEndian.PutUint64(host[8:], rand.Uint64())
-	return fill(p[rand.IntN(len(p))], host)
+	return fill(pfx, host)
 }
 
 // sticky 把 key 哈希成固定地址：同一个 key 永远得到同一个结果，无需保存状态。

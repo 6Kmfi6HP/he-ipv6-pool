@@ -45,7 +45,7 @@ func (p *Proxy) dispatch(c net.Conn, hl *chanListener) {
 	if first[0] == socksVer {
 		defer pc.Close()
 		if err := p.socks5(pc); err != nil {
-			slog.Debug("socks5", "client", c.RemoteAddr(), "err", err)
+			slog.Debug("socks5 握手失败", "client", c.RemoteAddr(), "err", err)
 		}
 		return
 	}

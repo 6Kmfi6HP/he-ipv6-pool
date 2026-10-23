@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -137,5 +139,26 @@ func TestEnvConfigUnset(t *testing.T) {
 	}
 	if used, err := applyEnv(&config{}); used || err != nil {
 		t.Fatalf("没有环境变量时: used=%v err=%v", used, err)
+	}
+}
+
+func TestSetupLog(t *testing.T) {
+	t.Cleanup(func() { slog.SetLogLoggerLevel(slog.LevelInfo) })
+	debugOn := func() bool { return slog.Default().Enabled(context.Background(), slog.LevelDebug) }
+
+	t.Setenv("LOG_LEVEL", "debug")
+	if err := setupLog(false); err != nil || !debugOn() {
+		t.Fatalf("LOG_LEVEL=debug 应当打开 debug: err=%v", err)
+	}
+	t.Setenv("LOG_LEVEL", "warn")
+	if err := setupLog(true); err != nil || !debugOn() {
+		t.Fatalf("-v 应当优先: err=%v", err)
+	}
+	if err := setupLog(false); err != nil || debugOn() || slog.Default().Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatalf("LOG_LEVEL=warn 时不应输出 info: err=%v", err)
+	}
+	t.Setenv("LOG_LEVEL", "verbose")
+	if err := setupLog(false); err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {
+		t.Fatalf("无效的 LOG_LEVEL 应当报错: %v", err)
 	}
 }
